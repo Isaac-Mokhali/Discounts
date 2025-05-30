@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.Data.SQLite;
 using System.IO;
+using System.Security.Cryptography;
+using System.Text;
 
 public class CodeStorage
 {
@@ -14,7 +16,7 @@ public class CodeStorage
         InitializeDatabase();
     }
 
-    // Ensure database and table exist
+    // Initialize the database and table
     private void InitializeDatabase()
     {
         if (!File.Exists(_dbPath))
@@ -27,6 +29,7 @@ public class CodeStorage
 
         string createTable = @"CREATE TABLE IF NOT EXISTS DiscountCodes (
                                 Code TEXT PRIMARY KEY,
+                                Salt TEXT,
                                 IsUsed INTEGER DEFAULT 0
                               )";
 
@@ -34,7 +37,17 @@ public class CodeStorage
         command.ExecuteNonQuery();
     }
 
-    // Store new codes in the DB
+    // Securely hash discount code with a salt
+    private string HashCode(string code, string salt)
+    {
+        using (SHA256 sha256 = SHA256.Create())
+        {
+            byte[] saltedCode = Encoding.UTF8.GetBytes(code + salt); // Combine code and salt
+            byte[] hash = sha256.ComputeHash(saltedCode);
+            return Convert.ToBase64String(hash);
+        }
+    }
+
     public void SaveCodes(IEnumerable<string> codes)
     {
         using var connection = new SQLiteConnection(_connectionString);
@@ -43,42 +56,76 @@ public class CodeStorage
         using var transaction = connection.BeginTransaction();
         foreach (var code in codes)
         {
-            var cmd = new SQLiteCommand("INSERT OR IGNORE INTO DiscountCodes (Code) VALUES (@code)", connection);
-            cmd.Parameters.AddWithValue("@code", code);
+            string salt = Guid.NewGuid().ToString(); // Generate a unique salt for each code
+            string hashedCode = HashCode(code, salt);
+
+            // Save the hashed code and the salt
+            var cmd = new SQLiteCommand("INSERT OR IGNORE INTO DiscountCodes (Code, Salt) VALUES (@code, @salt)", connection);
+            cmd.Parameters.AddWithValue("@code", hashedCode);
+            cmd.Parameters.AddWithValue("@salt", salt);
             cmd.ExecuteNonQuery();
         }
 
         transaction.Commit();
     }
 
-    // Check if code exists and is not used
+    // Attempts to use a discount code. Returns true if the code is valid and unused, and marks it as used.
     public bool UseCode(string code)
     {
         using var connection = new SQLiteConnection(_connectionString);
         connection.Open();
 
-        var cmd = new SQLiteCommand("SELECT IsUsed FROM DiscountCodes WHERE Code = @code", connection);
-        cmd.Parameters.AddWithValue("@code", code);
-        var result = cmd.ExecuteScalar();
+        var cmd = new SQLiteCommand("SELECT Code, Salt, IsUsed FROM DiscountCodes", connection);
+        using var reader = cmd.ExecuteReader();
 
-        if (result == null || Convert.ToInt32(result) == 1)
-            return false;
+        while (reader.Read())
+        {
+            string storedHash = reader.GetString(0);
+            string salt = reader.GetString(1);
+            bool isUsed = reader.GetInt32(2) == 1;
 
-        // Mark code as used
-        cmd = new SQLiteCommand("UPDATE DiscountCodes SET IsUsed = 1 WHERE Code = @code", connection);
-        cmd.Parameters.AddWithValue("@code", code);
-        cmd.ExecuteNonQuery();
+            // Hash the input code using the retrieved salt
+            string computedHash = HashCode(code, salt);
 
-        return true;
+            if (computedHash == storedHash)
+            {
+                if (isUsed)
+                    return false;
+
+                // Mark the code as used in the database
+                var updateCmd = new SQLiteCommand("UPDATE DiscountCodes SET IsUsed = 1 WHERE Code = @code", connection);
+                updateCmd.Parameters.AddWithValue("@code", storedHash);
+                updateCmd.ExecuteNonQuery();
+                return true;
+            }
+        }
+
+        return false; // No matching valid code found
     }
 
+    // Checks if a discount code exists and is valid (regardless of whether it's been used)
     public bool CodeExists(string code)
     {
         using var connection = new SQLiteConnection(_connectionString);
         connection.Open();
 
-        var cmd = new SQLiteCommand("SELECT 1 FROM DiscountCodes WHERE Code = @code", connection);
-        cmd.Parameters.AddWithValue("@code", code);
-        return cmd.ExecuteScalar() != null;
+        var cmd = new SQLiteCommand("SELECT Code, Salt FROM DiscountCodes", connection);
+        using var reader = cmd.ExecuteReader();
+
+        while (reader.Read())
+        {
+            string storedHash = reader.GetString(0);
+            string salt = reader.GetString(1);
+
+
+            string computedHash = HashCode(code, salt);
+
+
+            if (computedHash == storedHash)
+                return true; // Code exists and matches
+        }
+
+        return false; // No matching code found
     }
 }
+
